@@ -1,0 +1,38 @@
+import pandas as pd
+import numpy as np
+from shapely.geometry import MultiPoint, LineString
+
+# Suppose you have a DataFrame 'edge_data' as before, with lat/lon for u and v, and 'type'
+target_edges = edge_data[edge_data['type'] == 'target']
+
+# Calculate midpoints for each target edge
+midpoints = []
+for _, row in target_edges.iterrows():
+    lat_u, lon_u = row['lat_u'], row['lon_u']
+    lat_v, lon_v = row['lat_v'], row['lon_v']
+    midpoint_lat = (lat_u + lat_v) / 2
+    midpoint_lon = (lon_u + lon_v) / 2
+    midpoints.append({'lat': midpoint_lat, 'lon': midpoint_lon, 'length': row['length']})
+
+midpoints_df = pd.DataFrame(midpoints)
+
+# Weighted centroid
+weights = midpoints_df['length']
+centroid_lat = np.average(midpoints_df['lat'], weights=weights)
+centroid_lon = np.average(midpoints_df['lon'], weights=weights)
+
+# Weighted mean distance to centroid
+dists = np.sqrt((midpoints_df['lat'] - centroid_lat)**2 + (midpoints_df['lon'] - centroid_lon)**2)
+weighted_mean_dist = np.average(dists, weights=weights)
+
+# (Optional) Convex hull area (in degree^2; for real distances, project to meters)
+points = [ (row['lon'], row['lat']) for _, row in midpoints_df.iterrows() ]
+if len(points) >= 3:
+    hull = MultiPoint(points).convex_hull
+    hull_area = hull.area
+else:
+    hull_area = 1  # Avoid division by zero for 1-2 points
+
+# Spatial Efficiency Score (SES)
+SES = 1 / (weighted_mean_dist * hull_area)
+print(f"Spatial Efficiency Score (SES): {SES:.4f}")
