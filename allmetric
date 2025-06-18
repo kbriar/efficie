@@ -1,0 +1,176 @@
+import pandas as pd
+import numpy as np
+from shapely.geometry import LineString, MultiPoint
+from scipy.stats import pearsonr
+import geopandas as gpd
+
+# ==== 1. Input: Edge Table with Node Coordinates ====
+edge_data = pd.DataFrame({
+    'u': [1, 2, 2, 3],
+    'v': [2, 3, 4, 4],
+    'lat_u': [12.9716, 12.9720, 12.9720, 12.9730],
+    'lon_u': [77.5946, 77.5948, 77.5948, 77.5950],
+    'lat_v': [12.9720, 12.9730, 12.9735, 12.9740],
+    'lon_v': [77.5948, 77.5950, 77.5951, 77.5952],
+    'length': [2.2, 2.2, 2.8, 2.2],
+    'type': ['target', 'normal', 'normal', 'target']
+})
+
+# ==== 2. Calculate midpoints for each target edge ====
+target_edges = edge_data[edge_data['type'] == 'target']
+midpoints = []
+for _, row in target_edges.iterrows():
+    line = LineString([(row['lon_u'], row['lat_u']), (row['lon_v'], row['lat_v'])])
+    midpoint = line.interpolate(0.5, normalized=True)
+    midpoints.append({
+        'lon': midpoint.x,
+        'lat': midpoint.y,
+        'length': row['length']
+    })
+midpoints_df = pd.DataFrame(midpoints)
+
+# ==== 3. Convert to GeoDataFrame and Project to UTM ====
+gdf = gpd.GeoDataFrame(
+    midpoints_df,
+    geometry=gpd.points_from_xy(midpoints_df['lon'], midpoints_df['lat']),
+    crs="EPSG:4326"  # WGS84 (lat/lon)
+)
+gdf_utm = gdf.to_crs(gdf.estimate_utm_crs())  # Auto-selects appropriate UTM zone
+
+# ==== 4. Extract projected coordinates ====
+gdf_utm['x'] = gdf_utm.geometry.x
+gdf_utm['y'] = gdf_utm.geometry.y
+
+# ==== 5. Shared Calculations ====
+points = MultiPoint(list(gdf_utm.geometry))
+hull_area = points.convex_hull.area if len(points) >= 3 else 1  # in square meters
+
+weights = gdf_utm['length']
+centroid_x = np.average(gdf_utm['x'], weights=weights)
+centroid_y = np.average(gdf_utm['y'], weights=weights)
+total_target_length = weights.sum()
+
+# ==== 6. SPAEF Metric ====
+def calculate_spaef(observed, simulated):
+    alpha = pearsonr(observed.flatten(), simulated.flatten())[0]
+    beta = np.std(simulated) / np.std(observed)
+    hist_obs, _ = np.histogram(observed, bins=20, density=True)
+    hist_sim, _ = np.histogram(simulated, bins=20, density=True)
+    gamma = np.sum(np.minimum(hist_obs, hist_sim))
+    return 1 - np.sqrt((alpha - 1)**2 + (beta - 1)**2 + (gamma - 1)**2)
+
+x = gdf_utm['x'].values
+y = gdf_utm['y'].values
+observed, _, _ = np.histogram2d(x, y, bins=5, weights=weights)
+simulated = np.full_like(observed, np.mean(observed))  # ideal uniform distribution
+spaef = calculate_spaef(observed, simulated)
+
+# ==== 7. Density Metric ====
+density = total_target_length / hull_area if hull_area != 0 else 0  # length per sq. meter
+
+# ==== 8. Proximity Metric (Weighted Mean Distance to Centroid) ====
+dists = np.sqrt((gdf_utm['x'] - centroid_x)**2 + (gdf_utm['y'] - centroid_y)**2)
+proximity = np.average(dists, weights=weights)  # in meters
+
+# ==== 9. Convex Hull Ratio ====
+ch_ratio = total_target_length / hull_area if hull_area != 0 else 0
+
+# ==== 10. Spatial Efficiency Score (SES) ====
+SES = 1 / (proximity * hull_area) if (proximity != 0 and hull_area != 0) else 0
+
+# ==== 11. Results ====
+print(f"SPAEF: {spaef:.3f}")
+print(f"Density (target length/area): {density:.6f} (per sq. meter)")
+print(f"Proximity (mean distance to centroid): {proximity:.2f} meters")
+print(f"Convex Hull Ratio: {ch_ratio:.6f}")
+print(f"Spatial Efficiency Score (SES): {SES:.8f}")
+
+# Optional: Print projected midpoints for inspection
+print("\nProjected midpoints (meters):")
+print(gdf_utm[['x', 'y', 'length']])
+
+
+
+Here’s how to interpret each spatial efficiency metric from the code above:
+1. SPAEF (SPAtial EFficiency)
+
+    Range: Typically from –∞ to 1 (best is 1).
+
+    Interpretation:
+
+        Closer to 1: Your target edge midpoints are distributed similarly to a uniform (evenly spread) pattern.
+
+        Near 0 or Negative: Your target midpoints are highly clustered or irregular compared to a uniform pattern.
+
+    Use: Compare how well your spatial pattern matches an “ideal” or reference distribution.
+
+2. Density (Target Length / Area)
+
+    Unit: Target edge length per square meter (e.g., meters/m²).
+
+    Interpretation:
+
+        Higher density: More target edge length is packed into a smaller area (targets are spatially efficient/compact).
+
+        Lower density: Target edge length is spread over a larger area (targets are scattered).
+
+    Use: Useful for comparing how “packed” your targets are across different networks or areas.
+
+3. Proximity (Weighted Mean Distance to Centroid)
+
+    Unit: Meters.
+
+    Interpretation:
+
+        Lower value: Target midpoints are closer to the weighted centroid (more spatially efficient/compact).
+
+        Higher value: Targets are farther from the centroid (more scattered).
+
+    Use: Directly quantifies the average “spread” of your targets from the center.
+
+4. Convex Hull Ratio (Total Target Length / Convex Hull Area)
+
+    Unit: Meters per square meter (m/m²).
+
+    Interpretation:
+
+        Higher value: More target length per unit area enclosed by the convex hull (targets are efficiently packed).
+
+        Lower value: Less target length per unit area (targets are inefficiently spread).
+
+    Use: Good for comparing spatial efficiency between different sets of targets.
+
+5. SES (Spatial Efficiency Score)
+
+    Unit: 1 / (meters × square meters), a dimensionless compactness index.
+
+    Interpretation:
+
+        Higher SES: Targets are both close to the centroid and tightly packed within a small convex hull—high spatial efficiency.
+
+        Lower SES: Targets are far from the centroid and/or spread over a large area—low spatial efficiency.
+
+    Use: Provides a single, composite score for comparing overall spatial efficiency between different scenarios or time periods.
+
+Summary Table
+Metric	High Value Means...	Low Value Means...
+SPAEF	Pattern is uniform/efficient	Pattern is clustered/irregular
+Density	Targets are compact	Targets are scattered
+Proximity	Targets are close to centroid	Targets are far from centroid
+Convex Hull Ratio	Length is efficiently packed	Length is inefficiently spread
+SES	High overall spatial efficiency	Low overall spatial efficiency
+How to Use These Metrics
+
+    Compare different groups or time periods: Higher density, higher SES, lower proximity = more spatially efficient.
+
+    Set benchmarks: Use these metrics to set targets for future planning or to compare operational areas.
+
+    Identify outliers: If one area has much lower SES or density, investigate why (e.g., network design, operational constraints).
+
+In short:
+
+    Higher SPAEF, density, convex hull ratio, and SES are better.
+
+    Lower proximity is better.
+
+    Use these metrics to benchmark, compare, and improve your spatial planning or network design!
