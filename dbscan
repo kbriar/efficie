@@ -1,0 +1,145 @@
+import pandas as pd
+
+# sample data
+df = pd.DataFrame({
+    'n1': [1, 2, 2, 3],
+    'n2': [2, 3, 4, 4],
+    'weight_': [2.2, 2.2, 2.8, 2.2],
+    'edge_status': ['target', 'normal', 'normal', 'target'],
+    'polyline': [
+        '(12.9716 77.5946, 12.9720 77.5948, 12.9725 77.5949, 12.9720 77.5948)',
+        '(12.9720 77.5948, 12.9723 77.5949, 12.9727 77.5950, 12.9730 77.5950)',
+        '(12.9720 77.5948, 12.9724 77.5949, 12.9731 77.5951, 12.9735 77.5951)',
+        '(12.9730 77.5950, 12.9732 77.5951, 12.9738 77.5952, 12.9740 77.5952)'
+    ]
+})
+
+# helper to extract first & last lat/lon
+def extract_ends(polyline_str):
+    # remove parentheses, split on comma+space
+    pts = polyline_str.strip('()').split(', ')
+    first, last = pts[0], pts[-1]
+    # split each into [lat, lon]
+    lat1, lon1 = map(float, first.split())
+    lat2, lon2 = map(float, last.split())
+    return pd.Series({
+        'lat_n1': lat1,
+        'lon_n1': lon1,
+        'lat_n2': lat2,
+        'lon_n2': lon2
+    })
+
+# apply and join back to original columns
+ends = df['polyline'].apply(extract_ends)
+result = pd.concat([df.drop(columns='polyline'), ends], axis=1)
+
+print(result)
+
+import pandas as pd
+import numpy as np
+import networkx as nx
+from shapely.geometry import LineString
+from scipy.spatial import cKDTree
+from sklearn.neighbors import NearestNeighbors
+from sklearn.cluster import DBSCAN
+import matplotlib.pyplot as plt
+
+# ==== 1. Input: Edge Table with Node Coordinates ====
+# Replace this with your actual data
+edge_data = pd.DataFrame({
+    'u': [1, 2, 2, 3],
+    'v': [2, 3, 4, 4],
+    'lat_u': [12.9716, 12.9720, 12.9720, 12.9730],
+    'lon_u': [77.5946, 77.5948, 77.5948, 77.5950],
+    'lat_v': [12.9720, 12.9730, 12.9735, 12.9740],
+    'lon_v': [77.5948, 77.5950, 77.5951, 77.5952],
+    'length': [2.2, 2.2, 2.8, 2.2],
+    'type': ['target', 'normal', 'normal', 'target']
+})
+
+# ==== 2. Build Nodes Dictionary from Edge Data ====
+nodes = {}
+for _, row in edge_data.iterrows():
+    if row['u'] not in nodes:
+        nodes[row['u']] = (row['lat_u'], row['lon_u'])
+    if row['v'] not in nodes:
+        nodes[row['v']] = (row['lat_v'], row['lon_v'])
+
+# ==== 3. Build NetworkX Graph ====
+def build_graph(edge_data, nodes):
+    G = nx.Graph()
+    for node_id, (lat, lon) in nodes.items():
+        G.add_node(node_id, lat=lat, lon=lon)
+    for _, row in edge_data.iterrows():
+        G.add_edge(row['u'], row['v'], length=row['length'], type=row['type'])
+    return G
+
+G = build_graph(edge_data, nodes)
+
+# ==== 4. Extract Target Edge Midpoints ====
+def extract_target_points(edge_data, nodes):
+    target_points = []
+    for _, row in edge_data[edge_data['type'] == 'target'].iterrows():
+        u_lat, u_lon = nodes[row['u']]
+        v_lat, v_lon = nodes[row['v']]
+        line = LineString([(u_lon, u_lat), (v_lon, v_lat)])  # (lon, lat) for x, y
+        midpoint = line.interpolate(0.5, normalized=True)
+        target_points.append({
+            'edge': (row['u'], row['v']),
+            'lon': midpoint.x,
+            'lat': midpoint.y,
+            'length': row['length']
+        })
+    return pd.DataFrame(target_points)
+
+target_points_df = extract_target_points(edge_data, nodes)
+
+# ==== 5. Find Nearest Network Node for Each Target Point ====
+node_coords = np.array([(data['lon'], data['lat']) for nid, data in G.nodes(data=True)])
+tree = cKDTree(node_coords)
+target_coords = target_points_df[['lon', 'lat']].values
+_, idxs = tree.query(target_coords)
+target_nodes = [list(G.nodes())[i] for i in idxs]
+
+# ==== 6. Compute Network Distance Matrix ====
+def compute_network_distances(G, target_nodes):
+    n = len(target_nodes)
+    dist_matrix = np.full((n, n), np.inf)
+    for i, u in enumerate(target_nodes):
+        lengths = nx.single_source_dijkstra_path_length(G, u, weight='length')
+        for j, v in enumerate(target_nodes):
+            dist_matrix[i, j] = lengths.get(v, np.inf)
+    return dist_matrix
+
+dist_matrix = compute_network_distances(G, target_nodes)
+
+# ==== 7. k-Distance Plot for DBSCAN eps Selection ====
+k = 2  # min_samples for DBSCAN
+nbrs = NearestNeighbors(n_neighbors=k, metric='precomputed').fit(dist_matrix)
+distances, _ = nbrs.kneighbors(dist_matrix)
+k_distances = np.sort(distances[:, k-1])
+plt.plot(k_distances, marker='o')
+plt.xlabel('Points sorted by distance')
+plt.ylabel(f'{k}th Nearest Neighbor Distance')
+plt.title('k-Distance Plot for DBSCAN eps Selection')
+plt.show()
+
+# ==== 8. Cluster Target Points with DBSCAN ====
+eps = 3.0  # Set based on the k-distance plot
+db = DBSCAN(eps=eps, min_samples=1, metric='precomputed')
+labels = db.fit_predict(dist_matrix)
+target_points_df['cluster'] = labels
+
+# ==== 9. Visualize Clusters ====
+plt.figure(figsize=(10, 6))
+for cluster in target_points_df['cluster'].unique():
+    cluster_points = target_points_df[target_points_df['cluster'] == cluster]
+    plt.scatter(cluster_points['lon'], cluster_points['lat'], label=f'Cluster {cluster}')
+plt.xlabel('Longitude')
+plt.ylabel('Latitude')
+plt.title('Network-Based Clusters of Target Points')
+plt.legend()
+plt.show()
+
+# ==== 10. Show Result Table ====
+print(target_points_df)
